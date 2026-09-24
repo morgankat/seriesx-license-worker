@@ -63,6 +63,24 @@ export default {
       return json({ok:true,clientId,status,expiresAt:record.expiresAt});
     }
 
+    // NEW: list every client ever set, so the owner panel can show a real
+    // list instead of only checking one clientId at a time. Same owner
+    // session auth as /admin/license.
+    if(u.pathname==='/admin/clients'&&req.method==='GET'){
+      const auth=norm(req.headers.get('Authorization'));
+      const token=auth.startsWith('Bearer ')?auth.slice(7):'';
+      const sess=token?await env.LICENSES.get('admin-session:'+token):null;
+      if(!sess)return json({description:'Owner session expired or invalid.'},401);
+      const list=await env.LICENSES.list({prefix:'license:'});
+      const clients=await Promise.all(list.keys.map(async k=>{
+        const id=k.name.slice('license:'.length);
+        const raw=await env.LICENSES.get(k.name);
+        let rec=null; try{rec=JSON.parse(raw)}catch{}
+        return {clientId:id,status:activeStatus(rec),updatedAt:rec?.updatedAt||null,expiresAt:rec?.expiresAt||null};
+      }));
+      return json({clients});
+    }
+
     return json({ok:true,service:'Series X License Service'});
   }
 }
