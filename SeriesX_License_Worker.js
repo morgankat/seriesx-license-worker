@@ -7,7 +7,7 @@
  *
  * KV record format (JSON):
  *   {"status":"active","expiresAt":0}
- * status may be active, blocked, suspended, expired.
+ * status may be pending, active, blocked, suspended, expired.
  *
  * IMPORTANT: this service only becomes a real anti-unlock mechanism when the
  * trading gateway/OAuth exchange also checks this license server before issuing
@@ -34,6 +34,30 @@ export default {
     if(req.method==='OPTIONS')return new Response('',{status:204,headers:cors()});
     const u=new URL(req.url);
 
+    // Public client registration: called automatically after a successful
+    // broker login. It never grants owner/admin access. New accounts start as
+    // pending so the owner can see every login immediately and activate paid
+    // clients with one tap; existing status is preserved on later logins.
+    if(u.pathname==='/register'&&req.method==='POST'){
+      let body={};try{body=await req.json()}catch{return json({description:'Invalid JSON.'},400)}
+      const clientId=norm(body.clientId);
+      if(!clientId||clientId.length>120)return json({description:'Invalid clientId.'},400);
+      const key='license:'+clientId;
+      const raw=await env.LICENSES.get(key);
+      let rec=null;try{rec=raw?JSON.parse(raw):null}catch{}
+      const now=Date.now();
+      if(!rec){
+        rec={status:'pending',createdAt:now,updatedAt:now,lastSeenAt:now,expiresAt:0,broker:norm(body.broker)||'unknown',env:norm(body.env)||'unknown',appVersion:norm(body.appVersion)||'Series X'};
+      }else{
+        rec.lastSeenAt=now;rec.updatedAt=now;
+        if(body.broker)rec.broker=norm(body.broker);
+        if(body.env)rec.env=norm(body.env);
+        if(body.appVersion)rec.appVersion=norm(body.appVersion);
+      }
+      await env.LICENSES.put(key,JSON.stringify(rec));
+      return json({ok:true,clientId,status:activeStatus(rec),createdAt:rec.createdAt||now,lastSeenAt:rec.lastSeenAt});
+    }
+
     if(u.pathname==='/license'&&req.method==='GET'){
       const id=norm(u.searchParams.get('clientId'));
       const rec=await readLicense(env,id);
@@ -57,15 +81,15 @@ export default {
       if(!sess)return json({description:'Owner session expired or invalid.'},401);
       let body={};try{body=await req.json()}catch{return json({description:'Invalid JSON.'},400)}
       const clientId=norm(body.clientId),status=norm(body.status);
-      if(!clientId||!['active','blocked','suspended','expired'].includes(status))return json({description:'Invalid clientId or status.'},400);
-      const record={status,updatedAt:Date.now(),expiresAt:body.expiresAt?Number(body.expiresAt):0};
+      if(!clientId||!['pending','active','blocked','suspended','expired'].includes(status))return json({description:'Invalid clientId or status.'},400);
+      const existingRaw=await env.LICENSES.get('license:'+clientId);
+      let existing=null;try{existing=existingRaw?JSON.parse(existingRaw):null}catch{}
+      const now=Date.now();
+      const record={...(existing||{}),status,updatedAt:now,expiresAt:body.expiresAt?Number(body.expiresAt):(existing?.expiresAt||0),lastSeenAt:existing?.lastSeenAt||now,createdAt:existing?.createdAt||now};
       await env.LICENSES.put('license:'+clientId,JSON.stringify(record));
       return json({ok:true,clientId,status,expiresAt:record.expiresAt});
     }
 
-    // NEW: list every client ever set, so the owner panel can show a real
-    // list instead of only checking one clientId at a time. Same owner
-    // session auth as /admin/license.
     if(u.pathname==='/admin/clients'&&req.method==='GET'){
       const auth=norm(req.headers.get('Authorization'));
       const token=auth.startsWith('Bearer ')?auth.slice(7):'';
@@ -75,9 +99,10 @@ export default {
       const clients=await Promise.all(list.keys.map(async k=>{
         const id=k.name.slice('license:'.length);
         const raw=await env.LICENSES.get(k.name);
-        let rec=null; try{rec=JSON.parse(raw)}catch{}
-        return {clientId:id,status:activeStatus(rec),updatedAt:rec?.updatedAt||null,expiresAt:rec?.expiresAt||null};
+        let rec=null;try{rec=raw?JSON.parse(raw):null}catch{}
+        return {clientId:id,status:activeStatus(rec),createdAt:rec?.createdAt||null,updatedAt:rec?.updatedAt||null,lastSeenAt:rec?.lastSeenAt||null,expiresAt:rec?.expiresAt||null,broker:rec?.broker||null,env:rec?.env||null};
       }));
+      clients.sort((a,b)=>(b.lastSeenAt||0)-(a.lastSeenAt||0));
       return json({clients});
     }
 
